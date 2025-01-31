@@ -1,1 +1,6 @@
-credentials_db.*
+/dags/credentials_db.*
+/dags/__pycache__
+/__pycache__
+/config
+/logs
+/plugins

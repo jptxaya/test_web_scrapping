@@ -5,6 +5,8 @@ import re
 from pymongo import MongoClient
 import credentials_db as cred
 import logging
+from airflow.exceptions import AirflowFailException
+
 
 
 
@@ -15,6 +17,7 @@ def get_new_records(year,month,recipe_links):
         if  ref.startswith("/recetas-") or ref.startswith("/postres") or ref.startswith("/recetario"):
             recipe_links.add(ref)
     return recipe_links
+
 
 def get_elaboration_times(content,html_class):
     time = None
@@ -69,7 +72,7 @@ def get_ingredients_preparation(content):
             preparation = " ".join(steps)
     return ingredients, preparation
 
-def get_RecipesInformation(recipe_links):
+def get_RecipesInformation(recipes_links):
     recipeList = []
     print(f"Total recipes to process:{len(recipes_links)}")
     for recipe in recipes_links:
@@ -161,60 +164,74 @@ def get_RecipesInformation(recipe_links):
                 recipeList.append(recipeDict)
     return recipeList
 
+def getLastUpdateDate():
+    #Connection to MongoDB
+    mongoClient = MongoClient(cred.uri_mongo)
+    db_mongo = mongoClient["project_recipes"]
+    recipe_collection = db_mongo["recipes"]
+
+    creation_status = False #Variable to control the first time we create the DB
+    result_updateDate = recipe_collection.find_one({"lastYearMonth":{"$exists": True}},{"_id":0})
+    if result_updateDate:
+        startYear = int(result_updateDate["lastYearMonth"][:4])
+        startMonth = int(result_updateDate["lastYearMonth"][4:])
+        logging.info(f"LastYearMonth:{result_updateDate["lastYearMonth"]}")
+    else:
+        startYear = 2005 # For Initial load only
+        startMonth = 1
+        creation_status = True
+    mongoClient.close()
+    return  {"startYear": startYear,
+             "startMonth": startMonth,
+             "creation_status": creation_status
+            }
 
 
-#Connection to MongoDB
-mongoClient = MongoClient(cred.uri_mongo)
-db_mongo = mongoClient["project_recipes"]
-recipe_collection = db_mongo["recipes"]
-
-logging.basicConfig()
-
-result_updateDate = recipe_collection.find_one({"lastYearMonth":{"$exists": True}},{"_id":0})
-if result_updateDate:
-    startYear = int(result_updateDate["lastYearMonth"][:4])
-    startMonth = int(result_updateDate["lastYearMonth"][4:])
-    logging.info(f"LastYearMonth:{result_updateDate["lastYearMonth"]}")
-else:
-    startYear = 2005 # For Initial load only
-    startMonth = 1
-
-
-#Load of all_recipeURLs from the webpage
-recipes_links = set()
-lastYearMonthProcessed = "000000"
-for year in range(startYear,dt.datetime.now().year + 1):
-    lastYearMonthProcessed = str(year) + lastYearMonthProcessed[4:6]
-    for month in range(startMonth,13):
-        lastYearMonthProcessed = lastYearMonthProcessed[:4] + (str(month) if month > 9 else "0"+str(month))
-        recipes_links = get_new_records(year,month,recipes_links)
+def getRecipeLinks(startYear, startMonth):
+    #Load of all_recipeURLs from the webpage
+    recipes_links = set()
+    lastYearMonthProcessed = "000000"
+    for year in range(startYear,dt.datetime.now().year + 1):
+        lastYearMonthProcessed = str(year) + lastYearMonthProcessed[4:6]
+        for month in range(startMonth,13):
+            lastYearMonthProcessed = lastYearMonthProcessed[:4] + (str(month) if month > 9 else "0"+str(month))
+            recipes_links = get_new_records(year,month,recipes_links)
+            if len(recipes_links) > 100:
+                break
         if len(recipes_links) > 100:
             break
-    if len(recipes_links) > 100:
-        break
-    if lastYearMonthProcessed[4:6] == "12":
-        startMonth = 1
+        if lastYearMonthProcessed[4:6] == "12":
+            startMonth = 1
+    if len(recipes_links) == 0:
+        raise AirflowFailException(f"Error getting recipe links from {startYear}-{startMonth}")
+    return recipes_links,lastYearMonthProcessed
 
 
-recipeList = get_RecipesInformation(recipe_links=recipes_links)
-
-if  not result_updateDate:
-    #Initial load
-    result_update = recipe_collection.insert_one({"lastYearMonth":lastYearMonthProcessed})
-    result_update = recipe_collection.insert_many(recipeList)
-    print(f"Total recipes inserted:{len(recipeList)}")
-else:
-    #Updating the document that contain the registry of the lastUpdate
-    result_update = recipe_collection.update_one({"lastYearMonth":{"$exists": True}},{"$set":{"lastYearMonth":lastYearMonthProcessed}})
-    count = 0
-    for rl in recipeList:
-        result_recipe = recipe_collection.find_one({"recipeName":rl["recipeName"]})
-        if not result_recipe:
-            count += 1
-            inserted_recipe = recipe_collection.insert_one(rl)
-    print(f"Total recipes inserted:{count}")
-mongoClient.close()
-logging.info(f"Process Ended")
+def getRecipesAndStorage(**kwargs):
+    xcom_value = kwargs["ti"].xcom_pull(task_ids="getLastUpdateDate")
+    recipeLinks,lastYearMonthProcessed = getRecipeLinks(xcom_value["startYear"],xcom_value["startMonth"])
+    recipeList = get_RecipesInformation(recipeLinks)
+    #Connection to MongoDB
+    mongoClient = MongoClient(cred.uri_mongo)
+    db_mongo = mongoClient["project_recipes"]
+    recipe_collection = db_mongo["recipes"]
+    if xcom_value["creation_status"]:
+         #Initial load
+        result_update = recipe_collection.insert_one({"lastYearMonth":lastYearMonthProcessed})
+        result_update = recipe_collection.insert_many(recipeList)
+        print(f"Total recipes inserted:{len(recipeList)}")
+    else:
+        #Updating the document that contain the registry of the lastUpdate
+        result_update = recipe_collection.update_one({"lastYearMonth":{"$exists": True}},{"$set":{"lastYearMonth":lastYearMonthProcessed}})
+        count = 0
+        for rl in recipeList:
+            result_recipe = recipe_collection.find_one({"recipeName":rl["recipeName"]})
+            if not result_recipe:
+                count += 1
+                inserted_recipe = recipe_collection.insert_one(rl)
+        print(f"Total recipes inserted:{count}")
+    mongoClient.close()
+    print("Process finished")
 
 
 
